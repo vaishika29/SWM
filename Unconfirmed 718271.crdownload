@@ -1,0 +1,263 @@
+from datetime import date, datetime, timedelta
+from typing import Iterable, Optional
+
+from .database import Database
+
+
+class ShopService:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def authenticate(self, username: str, password: str) -> Optional[dict]:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username=? AND password_hash=? AND active=1",
+                (username.strip(), Database.hash_password(password)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def setting(self, key: str, default: str = "") -> str:
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def save_setting(self, key: str, value: str) -> None:
+        with self.db.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+
+    def list_rows(self, table: str, search: str = "", columns: Iterable[str] = ()):
+        allowed = {
+            "products",
+            "customers",
+            "suppliers",
+            "sales",
+            "returns",
+            "investments",
+            "expenses",
+            "purchases",
+            "supplier_payments",
+            "users",
+        }
+        if table not in allowed:
+            raise ValueError("Unsupported table")
+        sql = f"SELECT * FROM {table}"
+        params: list = []
+        if search and columns:
+            clauses = [f"{col} LIKE ?" for col in columns]
+            sql += " WHERE " + " OR ".join(clauses)
+            params.extend([f"%{search}%"] * len(clauses))
+        order = "id DESC" if table not in {"products", "customers", "suppliers", "users"} else "name COLLATE NOCASE"
+        if table == "users":
+            order = "username"
+        sql += f" ORDER BY {order}"
+        with self.db.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def upsert_product(self, data: dict, product_id: Optional[int] = None) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        values = (
+            data["item_code"],
+            data["name"],
+            data.get("category", ""),
+            data.get("unit", "Kg"),
+            data.get("barcode", ""),
+            data["cost_price"],
+            data["selling_price"],
+            data["stock_qty"],
+            data["min_stock"],
+        )
+        with self.db.connect() as conn:
+            if product_id:
+                conn.execute(
+                    """
+                    UPDATE products SET item_code=?, name=?, category=?, unit=?, barcode=?, cost_price=?,
+                    selling_price=?, stock_qty=?, min_stock=?, updated_at=? WHERE id=?
+                    """,
+                    (*values, now, product_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO products(item_code,name,category,unit,barcode,cost_price,selling_price,stock_qty,min_stock,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (*values, now, now),
+                )
+
+    def delete(self, table: str, row_id: int) -> None:
+        if table not in {"products", "customers", "suppliers", "investments", "expenses", "purchases", "supplier_payments", "users"}:
+            raise ValueError("Delete is not enabled for this table")
+        with self.db.connect() as conn:
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+
+    def save_customer(self, data: dict, row_id: Optional[int] = None) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        values = (data["name"], data.get("phone", ""), data.get("email", ""), data.get("address", ""), data.get("outstanding_balance", 0))
+        with self.db.connect() as conn:
+            if row_id:
+                conn.execute("UPDATE customers SET name=?,phone=?,email=?,address=?,outstanding_balance=? WHERE id=?", (*values, row_id))
+            else:
+                conn.execute("INSERT INTO customers(name,phone,email,address,outstanding_balance,created_at) VALUES(?,?,?,?,?,?)", (*values, now))
+
+    def save_supplier(self, data: dict, row_id: Optional[int] = None) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        values = (data["name"], data.get("phone", ""), data.get("email", ""), data.get("address", ""), data.get("gstin", ""))
+        with self.db.connect() as conn:
+            if row_id:
+                conn.execute("UPDATE suppliers SET name=?,phone=?,email=?,address=?,gstin=? WHERE id=?", (*values, row_id))
+            else:
+                conn.execute("INSERT INTO suppliers(name,phone,email,address,gstin,created_at) VALUES(?,?,?,?,?,?)", (*values, now))
+
+    def add_money_record(self, table: str, data: dict) -> None:
+        with self.db.connect() as conn:
+            if table == "investments":
+                conn.execute(
+                    "INSERT INTO investments(title,amount,source,investment_date,notes) VALUES(?,?,?,?,?)",
+                    (data["title"], data["amount"], data.get("source", ""), data["date"], data.get("notes", "")),
+                )
+            elif table == "expenses":
+                conn.execute(
+                    "INSERT INTO expenses(category,description,amount,expense_date,paid_to,notes) VALUES(?,?,?,?,?,?)",
+                    (data["category"], data["description"], data["amount"], data["date"], data.get("paid_to", ""), data.get("notes", "")),
+                )
+            else:
+                raise ValueError("Unsupported money table")
+
+    def create_purchase(self, data: dict) -> None:
+        total = data["qty"] * data["unit_cost"]
+        with self.db.connect() as conn:
+            product = conn.execute("SELECT * FROM products WHERE id=?", (data["product_id"],)).fetchone()
+            conn.execute(
+                """
+                INSERT INTO purchases(supplier_id,product_id,product_name,qty,unit_cost,total,purchase_date,payment_status,notes)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (data["supplier_id"], data["product_id"], product["name"], data["qty"], data["unit_cost"], total, data["date"], data["payment_status"], data.get("notes", "")),
+            )
+            conn.execute(
+                "UPDATE products SET stock_qty=stock_qty+?, cost_price=?, updated_at=? WHERE id=?",
+                (data["qty"], data["unit_cost"], datetime.now().isoformat(timespec="seconds"), data["product_id"]),
+            )
+
+    def add_supplier_payment(self, data: dict) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO supplier_payments(supplier_id,amount,payment_date,method,notes) VALUES(?,?,?,?,?)",
+                (data["supplier_id"], data["amount"], data["date"], data.get("method", ""), data.get("notes", "")),
+            )
+
+    def next_invoice_no(self) -> str:
+        today_code = date.today().strftime("%Y%m%d")
+        with self.db.connect() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM sales WHERE invoice_no LIKE ?", (f"INV-{today_code}-%",)).fetchone()[0] + 1
+        return f"INV-{today_code}-{count:04d}"
+
+    def create_sale(self, customer_id: Optional[int], customer_name: str, items: list[dict], gst_rate: float, discount: float, paid: float, notes: str, user_id: int) -> str:
+        if not items:
+            raise ValueError("Add at least one sale item")
+        invoice_no = self.next_invoice_no()
+        subtotal = sum(item["qty"] * item["unit_price"] for item in items)
+        gst_amount = max(subtotal - discount, 0) * gst_rate / 100
+        total = max(subtotal - discount, 0) + gst_amount
+        balance = max(total - paid, 0)
+        with self.db.connect() as conn:
+            for item in items:
+                product = conn.execute("SELECT * FROM products WHERE id=?", (item["product_id"],)).fetchone()
+                if product is None:
+                    raise ValueError("Product not found")
+                if product["stock_qty"] < item["qty"]:
+                    raise ValueError(f"Insufficient stock for {product['name']}")
+            cur = conn.execute(
+                """
+                INSERT INTO sales(invoice_no,customer_id,customer_name,sale_date,subtotal,gst_rate,gst_amount,discount,total,paid,balance,notes,created_by)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (invoice_no, customer_id, customer_name, date.today().isoformat(), subtotal, gst_rate, gst_amount, discount, total, paid, balance, notes, user_id),
+            )
+            sale_id = cur.lastrowid
+            for item in items:
+                product = conn.execute("SELECT * FROM products WHERE id=?", (item["product_id"],)).fetchone()
+                line_total = item["qty"] * item["unit_price"]
+                conn.execute(
+                    """
+                    INSERT INTO sale_items(sale_id,product_id,product_name,qty,unit_price,cost_price,line_total)
+                    VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (sale_id, product["id"], product["name"], item["qty"], item["unit_price"], product["cost_price"], line_total),
+                )
+                conn.execute("UPDATE products SET stock_qty=stock_qty-?, updated_at=? WHERE id=?", (item["qty"], datetime.now().isoformat(timespec="seconds"), product["id"]))
+            if customer_id:
+                conn.execute("UPDATE customers SET outstanding_balance=outstanding_balance+? WHERE id=?", (balance, customer_id))
+        return invoice_no
+
+    def sale_items(self, sale_id: int):
+        with self.db.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)).fetchall()]
+
+    def record_return(self, data: dict) -> None:
+        with self.db.connect() as conn:
+            sale = conn.execute("SELECT * FROM sales WHERE id=?", (data["sale_id"],)).fetchone() if data.get("sale_id") else None
+            product = conn.execute("SELECT * FROM products WHERE id=?", (data["product_id"],)).fetchone()
+            conn.execute(
+                """
+                INSERT INTO returns(sale_id,invoice_no,product_id,product_name,qty,refund_amount,reason,return_date)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (data.get("sale_id"), sale["invoice_no"] if sale else data.get("invoice_no", ""), data["product_id"], product["name"], data["qty"], data["refund_amount"], data["reason"], data["date"]),
+            )
+            conn.execute("UPDATE products SET stock_qty=stock_qty+?, updated_at=? WHERE id=?", (data["qty"], datetime.now().isoformat(timespec="seconds"), data["product_id"]))
+
+    def dashboard(self) -> dict:
+        today_s = date.today().isoformat()
+        week_s = (date.today() - timedelta(days=6)).isoformat()
+        month_s = date.today().replace(day=1).isoformat()
+        with self.db.connect() as conn:
+            one = lambda sql, p=(): conn.execute(sql, p).fetchone()[0] or 0
+            sales = one("SELECT SUM(total) FROM sales")
+            investments = one("SELECT SUM(amount) FROM investments")
+            expenses = one("SELECT SUM(amount) FROM expenses")
+            returns = one("SELECT SUM(refund_amount) FROM returns")
+            cogs = one("SELECT SUM(qty * cost_price) FROM sale_items")
+            gross_profit = sales - cogs - expenses - returns
+            low_stock = [dict(r) for r in conn.execute("SELECT item_code,name,stock_qty,min_stock FROM products WHERE stock_qty <= min_stock ORDER BY stock_qty ASC").fetchall()]
+            periods = {
+                "Today": one("SELECT SUM(total) FROM sales WHERE sale_date=?", (today_s,)),
+                "Last 7 Days": one("SELECT SUM(total) FROM sales WHERE sale_date>=?", (week_s,)),
+                "This Month": one("SELECT SUM(total) FROM sales WHERE sale_date>=?", (month_s,)),
+            }
+            trends = [dict(r) for r in conn.execute(
+                """
+                SELECT sale_date, SUM(total) revenue,
+                       SUM(total) - IFNULL((SELECT SUM(qty*cost_price) FROM sale_items si JOIN sales s2 ON s2.id=si.sale_id WHERE s2.sale_date=s.sale_date),0) profit
+                FROM sales s GROUP BY sale_date ORDER BY sale_date DESC LIMIT 12
+                """
+            ).fetchall()]
+            best = [dict(r) for r in conn.execute("SELECT product_name, SUM(qty) qty FROM sale_items GROUP BY product_name ORDER BY qty DESC LIMIT 5").fetchall()]
+        return {
+            "sales": sales,
+            "investments": investments,
+            "expenses": expenses,
+            "returns": returns,
+            "profit": gross_profit,
+            "low_stock": low_stock,
+            "periods": periods,
+            "trends": list(reversed(trends)),
+            "best": best,
+        }
+
+    def report_rows(self, report_type: str, start: str, end: str):
+        with self.db.connect() as conn:
+            if report_type == "Sales":
+                rows = conn.execute("SELECT invoice_no,customer_name,sale_date,subtotal,gst_amount,discount,total,paid,balance FROM sales WHERE sale_date BETWEEN ? AND ? ORDER BY sale_date,id", (start, end)).fetchall()
+                headings = ["Invoice", "Customer", "Date", "Subtotal", "GST", "Discount", "Total", "Paid", "Balance"]
+            elif report_type == "Expenses":
+                rows = conn.execute("SELECT category,description,amount,expense_date,paid_to FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date,id", (start, end)).fetchall()
+                headings = ["Category", "Description", "Amount", "Date", "Paid To"]
+            elif report_type == "Returns":
+                rows = conn.execute("SELECT invoice_no,product_name,qty,refund_amount,reason,return_date FROM returns WHERE return_date BETWEEN ? AND ? ORDER BY return_date,id", (start, end)).fetchall()
+                headings = ["Invoice", "Product", "Qty", "Refund", "Reason", "Date"]
+            else:
+                rows = conn.execute("SELECT item_code,name,category,unit,cost_price,selling_price,stock_qty,min_stock FROM products ORDER BY name").fetchall()
+                headings = ["Code", "Name", "Category", "Unit", "Cost", "Selling", "Stock", "Min Stock"]
+        return headings, [tuple(row) for row in rows]
+

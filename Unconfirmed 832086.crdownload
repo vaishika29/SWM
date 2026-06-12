@@ -1,0 +1,259 @@
+import hashlib
+import shutil
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Iterable
+
+from .config import BACKUP_DIR, DB_PATH
+
+
+class Database:
+    def __init__(self, path: Path = DB_PATH):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def initialize(self) -> None:
+        with self.connect() as conn:
+            self._create_schema(conn)
+            self._seed_defaults(conn)
+
+    def _create_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('Admin','Employee')),
+                full_name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                category TEXT,
+                unit TEXT NOT NULL DEFAULT 'Kg',
+                barcode TEXT,
+                cost_price REAL NOT NULL DEFAULT 0,
+                selling_price REAL NOT NULL DEFAULT 0,
+                stock_qty REAL NOT NULL DEFAULT 0,
+                min_stock REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS customers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                phone TEXT,
+                email TEXT,
+                address TEXT,
+                outstanding_balance REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS suppliers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                phone TEXT,
+                email TEXT,
+                address TEXT,
+                gstin TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_no TEXT UNIQUE NOT NULL,
+                customer_id INTEGER,
+                customer_name TEXT NOT NULL,
+                sale_date TEXT NOT NULL,
+                subtotal REAL NOT NULL,
+                gst_rate REAL NOT NULL,
+                gst_amount REAL NOT NULL,
+                discount REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL,
+                paid REAL NOT NULL DEFAULT 0,
+                balance REAL NOT NULL DEFAULT 0,
+                notes TEXT,
+                created_by INTEGER,
+                FOREIGN KEY(customer_id) REFERENCES customers(id),
+                FOREIGN KEY(created_by) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sale_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                qty REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                cost_price REAL NOT NULL,
+                line_total REAL NOT NULL,
+                FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS returns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER,
+                invoice_no TEXT,
+                product_id INTEGER,
+                product_name TEXT NOT NULL,
+                qty REAL NOT NULL,
+                refund_amount REAL NOT NULL,
+                reason TEXT NOT NULL,
+                return_date TEXT NOT NULL,
+                FOREIGN KEY(sale_id) REFERENCES sales(id),
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS investments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                amount REAL NOT NULL,
+                source TEXT,
+                investment_date TEXT NOT NULL,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                amount REAL NOT NULL,
+                expense_date TEXT NOT NULL,
+                paid_to TEXT,
+                notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS purchases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                supplier_id INTEGER,
+                product_id INTEGER,
+                product_name TEXT NOT NULL,
+                qty REAL NOT NULL,
+                unit_cost REAL NOT NULL,
+                total REAL NOT NULL,
+                purchase_date TEXT NOT NULL,
+                payment_status TEXT NOT NULL DEFAULT 'Unpaid',
+                notes TEXT,
+                FOREIGN KEY(supplier_id) REFERENCES suppliers(id),
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS supplier_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                supplier_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                payment_date TEXT NOT NULL,
+                method TEXT,
+                notes TEXT,
+                FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    def _seed_defaults(self, conn: sqlite3.Connection) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,full_name,created_at) VALUES(?,?,?,?,?)",
+                ("admin", self.hash_password("admin123"), "Admin", "Swamy Metal Admin", now),
+            )
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,full_name,created_at) VALUES(?,?,?,?,?)",
+                ("employee", self.hash_password("emp123"), "Employee", "Shop Employee", now),
+            )
+
+        settings = {
+            "dark_mode": "0",
+            "gst_rate": "18",
+            "shop_name": "Swamy Metal",
+            "shop_phone": "",
+            "shop_address": "",
+        }
+        for key, value in settings.items():
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+        if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+            products = [
+                ("MS-ROD-12", "MS Rod 12mm", "Mild Steel", "Kg", "", 52, 68, 850, 120),
+                ("SS-SHEET-18", "SS Sheet 18G", "Stainless Steel", "Sheet", "", 1180, 1450, 42, 8),
+                ("GI-PIPE-1", "GI Pipe 1 inch", "Pipe", "Length", "", 310, 420, 95, 20),
+                ("AL-ANGLE-25", "Aluminium Angle 25mm", "Aluminium", "Length", "", 180, 250, 18, 25),
+            ]
+            conn.executemany(
+                """
+                INSERT INTO products(item_code,name,category,unit,barcode,cost_price,selling_price,stock_qty,min_stock,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [(*p, now, now) for p in products],
+            )
+
+        if conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO customers(name,phone,email,address,outstanding_balance,created_at) VALUES(?,?,?,?,?,?)",
+                [
+                    ("Walk-in Customer", "", "", "", 0, now),
+                    ("Ravi Fabricators", "9876543210", "", "Industrial Area", 1250, now),
+                ],
+            )
+
+        if conn.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO suppliers(name,phone,email,address,gstin,created_at) VALUES(?,?,?,?,?,?)",
+                [
+                    ("Sri Lakshmi Steel Traders", "9845000001", "", "Bengaluru", "", now),
+                    ("Metro Metal Distributors", "9845000002", "", "Peenya", "", now),
+                ],
+            )
+
+        if conn.execute("SELECT COUNT(*) FROM investments").fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO investments(title,amount,source,investment_date,notes) VALUES(?,?,?,?,?)",
+                ("Opening capital", 250000, "Owner", now[:10], "Initial shop capital"),
+            )
+
+        if conn.execute("SELECT COUNT(*) FROM expenses").fetchone()[0] == 0:
+            sample_date = (datetime.now() - timedelta(days=1)).date().isoformat()
+            conn.executemany(
+                "INSERT INTO expenses(category,description,amount,expense_date,paid_to,notes) VALUES(?,?,?,?,?,?)",
+                [
+                    ("Transportation", "Material delivery", 1800, sample_date, "Local transport", ""),
+                    ("Electricity", "Monthly power bill", 3200, sample_date, "BESCOM", ""),
+                ],
+            )
+
+    def backup(self) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = BACKUP_DIR / f"swamy_metal_backup_{stamp}.db"
+        shutil.copy2(self.path, target)
+        return target
+
+    def restore(self, source: Path) -> None:
+        shutil.copy2(source, self.path)
+
+    def query(self, sql: str, params: Iterable = ()):
+        with self.connect() as conn:
+            return conn.execute(sql, tuple(params)).fetchall()
+

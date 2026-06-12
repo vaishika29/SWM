@@ -1,0 +1,14 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+BACKUP_DIR = BASE_DIR / "backups"
+EXPORT_DIR = BASE_DIR / "exports"
+DB_PATH = DATA_DIR / "swamy_metal_shop.db"
+
+APP_NAME = "Swamy Metal Shop Management System"
+DEFAULT_GST_RATE = 18.0
+
+for folder in (DATA_DIR, BACKUP_DIR, EXPORT_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
